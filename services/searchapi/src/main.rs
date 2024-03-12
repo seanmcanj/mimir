@@ -6,22 +6,27 @@ use actix_web::{
     App, HttpResponse, HttpServer, Responder,
 };
 use derive_more::{Display, Error};
-use qdrant_client::qdrant::vectors_config::Config;
+use qdrant_client::qdrant::{vectors_config::Config, Condition, Filter};
 use qdrant_client::qdrant::{CreateCollection, VectorParams, VectorsConfig};
 use qdrant_client::{prelude::*, qdrant};
-use serde_json::Value;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{Error, ErrorKind};
+
+
 // consts go here
 const QDRANT_URL_LOCAL: &str = "http://localhost:6334";
 
 // structs
 struct AppState {
     qdrant: QdrantClient,
+    httpclient: reqwest::Client,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Req {
-    name: String
+#[derive(Serialize, Deserialize, Debug)]
+struct EmbedResponse {
+    status: String,
+    embeddings: Box<[f32]>,
 }
 
 // error handler for qdrant
@@ -32,6 +37,9 @@ enum MyError {
 
     #[display(fmt = "bad request")]
     BadClientData,
+
+    #[display(fmt = "unknown error")]
+    UnknownError,
 }
 
 impl error::ResponseError for MyError {
@@ -45,6 +53,7 @@ impl error::ResponseError for MyError {
         match *self {
             MyError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             MyError::BadClientData => StatusCode::BAD_REQUEST,
+            MyError::UnknownError => StatusCode::FAILED_DEPENDENCY,
         }
     }
 }
@@ -54,54 +63,41 @@ async fn healthcheck() -> impl Responder {
     HttpResponse::Ok()
 }
 
-
-#[post("/create-collection")]
-async fn create_collection(
+#[post("/query")]
+async fn search_query(
     data: web::Data<AppState>,
-    name: String,
+    tenantid: String,
+    query: String,
 ) -> Result<impl Responder, MyError> {
     let client = &data.qdrant;
-    println!("{:?}", name);
-    let json_val:Req = serde_json::from_str(&name).unwrap();
+    let httpclient = &data.httpclient;
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("Connection".to_string(), "close".to_string());
 
-    let newname = json_val.name.to_string();
+    let mut map = HashMap::new();
+    map.insert("docs", [query]);
 
-    let req = client
-        .create_collection(&CreateCollection {
-            collection_name: String::from(newname),
-            vectors_config: Some(VectorsConfig {
-                config: Some(Config::Params(VectorParams {
-                    size: 10,
-                    distance: Distance::Cosine.into(),
-                    ..Default::default()
-                })),
-            }),
-            ..Default::default()
-        })
-        .await;
-   
-    match req.into() {
-        Ok(qdrant::CollectionOperationResponse { result, time }) => {
-            Ok(HttpResponse::Ok().body("created successfully"))
-        }
-        Err(err) => Err(MyError::InternalError),
-    }
-}
+    let resp = httpclient
+        .post("http://localhost:3000/get-embeddings")
+        .json(&map)
+        .send()
+        .await
+        .unwrap();
 
-#[delete("/delete-collection")]
-async fn delete_collection(
-    data: web::Data<AppState>,
-    name: String,
-) -> Result<impl Responder, MyError> {
-    let client = &data.qdrant;
 
-    let req = client.delete_collection(name).await;
 
-    match req.into() {
-        Ok(qdrant::CollectionOperationResponse { result, time }) => {
-            Ok(HttpResponse::Ok().body("deleted successfully"))
-        }
-        Err(err) => Err(MyError::InternalError),
+    match resp.status() {
+        reqwest::StatusCode::OK => match resp.text().await {
+            Ok(parsed) => {
+                let embeddings: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+                println!("{:?}", embeddings);
+                Ok(HttpResponse::Ok().body("created successfully"))
+            },
+            Err(err) => {
+                Err(MyError::UnknownError)
+            },
+        },
+        other => Err(MyError::UnknownError),
     }
 }
 
@@ -115,12 +111,12 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(AppState {
                 qdrant: QdrantClient::from_url(&qdrant_url).build().unwrap(),
+                httpclient: reqwest::Client::new(),
             }))
             .service(healthcheck)
-            .service(create_collection)
-            .service(delete_collection)
+            .service(search_query)
     })
-    .bind(("0.0.0.0", 3000))?
+    .bind(("0.0.0.0", 4000))?
     .run()
     .await
 }
